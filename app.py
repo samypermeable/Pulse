@@ -185,7 +185,6 @@ st.divider()
 # --- Processing Parameters ---
 CLIP_LIMIT = 3.0
 GAMMA = 1.2
-MAX_CRATER_SIZE = 2000000
 
 # --- Helper Function: Entropy Calculation ---
 def calculate_entropy(img):
@@ -292,10 +291,10 @@ else:
     img_array = np.array(image)
     img_height, img_width = img_array.shape
     
-    tab1, tab2, tab3 = st.tabs(["Image Enhancement", "Crater & Hazard Detection", "Upload New Image"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Image Enhancement", "Crater & Hazard Detection", "3D Map & Safe Landing", "Upload New Image"])
     
-    # Tab 3: Reset Interface
-    with tab3:
+    # Tab 4: Reset Interface
+    with tab4:
         st.markdown("<br><br><h4 class='center-text fade-in'>Ready for a new analysis?</h4><br>", unsafe_allow_html=True)
         btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
         with btn_col2:
@@ -304,99 +303,175 @@ else:
                     del st.session_state[key]
                 force_rerun()
 
-    # Tab 1: Image Enhancement Display
-    with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("<h4 class='center-text fade-in'>Original Dark Image</h4>", unsafe_allow_html=True)
-            st.image(img_array, use_container_width=True)
-            
-        with col2:
-            st.markdown("<h4 class='center-text fade-in'>Enhanced Image</h4>", unsafe_allow_html=True)
-            enh_placeholder = st.empty()
-            
-        metrics_placeholder_tab1 = st.empty()
-
-    # Tab 2: Crater & Hazard Detection Display
-    with tab2:
-        crater_placeholder = st.empty()
-        metrics_placeholder_tab2 = st.empty()
-
-    # Animation Execution Flow
-    if not st.session_state.has_processed:
-        scanner_html = f"""
-        <div class="scanner-container" style="aspect-ratio: {img_width} / {img_height};">
-            <div class="scanner-line"></div>
-            <div class="scanner-text">ENHANCING<br>LUNAR DATA...</div>
-        </div>
-        """
-        enh_placeholder.markdown(scanner_html, unsafe_allow_html=True)
-
-        crater_html = f"""
-        <div class="scanner-container" style="aspect-ratio: {img_width} / {img_height}; width: 80%; margin: 0 auto;">
-            <div class="scanner-line" style="animation-duration: 2.5s;"></div>
-            <div class="scanner-text">MAPPING CRATERS...</div>
-        </div>
-        """
-        crater_placeholder.markdown(crater_html, unsafe_allow_html=True)
-
-        time.sleep(3)
-        st.session_state.has_processed = True
-        
-    # --- Image Processing Pipeline ---
-    processed_img = cv2.bilateralFilter(img_array.copy(), 9, 75, 75)
+    # --- Pre-calculate all Image Data Before Rendering UI ---
+    
+    # 1. Image Processing (For Human Eyes & 3D Map)
     clahe = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=(8, 8))
-    processed_img = clahe.apply(processed_img)
-
+    base_img = clahe.apply(img_array.copy())
     invGamma = 1.0 / GAMMA
     table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
-    processed_img = cv2.LUT(processed_img, table)
+    base_img = cv2.LUT(base_img, table)
+    gaussian_blur_sharp = cv2.GaussianBlur(base_img, (5, 5), 1.0)
+    processed_img = cv2.addWeighted(base_img, 1.5, gaussian_blur_sharp, -0.5, 0)
     
-    # --- Crater Detection Logic ---
-    blur = cv2.GaussianBlur(processed_img, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = np.ones((3,3), np.uint8)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel) 
-    thresh = cv2.erode(thresh, np.ones((2,2), np.uint8), iterations=1)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 2. CRATER DETECTION LOGIC (PRECISION SEPARATION FIX)
+    detect_blur = cv2.GaussianBlur(processed_img, (7, 7), 0)
+    _, thresh_craters = cv2.threshold(detect_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    crater_data = [] 
+    # Clean separation: Open to break bridges between craters, small Close to fill internal noise
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh_craters = cv2.morphologyEx(thresh_craters, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    thresh_craters = cv2.morphologyEx(thresh_craters, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    
+    contours, _ = cv2.findContours(thresh_craters, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    crater_data = []
+    total_pixels = img_width * img_height
+    
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 150 < area < MAX_CRATER_SIZE: 
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0: continue
-            circularity = 4 * np.pi * (area / (perimeter * perimeter))
-            is_massive_crater = (area > 15000 and circularity >= 0.05)
-            is_normal_crater = (area <= 15000 and circularity >= 0.3)
-            if is_massive_crater or is_normal_crater:
-                x, y, w, h = cv2.boundingRect(cnt)
-                crater_data.append({"x": x, "y": y, "w": w, "h": h, "area": int(area), "circ": round(circularity, 2)})
+        
+        # Strict upper limit (15%) prevents massive overlapping mega-boxes
+        if 180 < area < (total_pixels * 0.15): 
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / float(h)
+            
+            # Clean square/oval aspect ratio limits
+            if 0.4 <= aspect_ratio <= 2.5:
+                perimeter = cv2.arcLength(cnt, True)
+                circ = 0.0 if perimeter == 0 else 4 * np.pi * (area / (perimeter * perimeter))
+                crater_data.append({"x": x, "y": y, "w": w, "h": h, "area": int(area), "circ": round(circ, 2)})
 
+    # Keep the top 35 sharpest distinct craters
     crater_data = sorted(crater_data, key=lambda c: c['area'], reverse=True)[:35]
 
-    # --- Render Tab 1 Results ---
-    with enh_placeholder.container():
-        st.image(processed_img, use_container_width=True)
+    # --- Animation Flow Control ---
+    if not st.session_state.has_processed:
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("<h4 class='center-text fade-in'>Original Dark Image</h4>", unsafe_allow_html=True)
+                st.image(img_array, use_container_width=True)
+            with col2:
+                st.markdown("<h4 class='center-text fade-in'>Enhanced Image</h4>", unsafe_allow_html=True)
+                scanner_html = f"""
+                <div class="scanner-container" style="aspect-ratio: {img_width} / {img_height};">
+                    <div class="scanner-line"></div>
+                    <div class="scanner-text">ENHANCING<br>LUNAR DATA...</div>
+                </div>
+                """
+                st.markdown(scanner_html, unsafe_allow_html=True)
+        with tab2:
+            crater_html = f"""
+            <br><br>
+            <div class="scanner-container" style="aspect-ratio: {img_width} / {img_height}; width: 80%; margin: 0 auto;">
+                <div class="scanner-line" style="animation-duration: 2.5s;"></div>
+                <div class="scanner-text">MAPPING CRATERS...</div>
+            </div>
+            """
+            st.markdown(crater_html, unsafe_allow_html=True)
+            
+        time.sleep(3)
+        st.session_state.has_processed = True
+        force_rerun()
 
-    with metrics_placeholder_tab1.container():
-        render_metrics_and_dl(img_array, processed_img, crater_data, "tab1")
+    # --- Render Final Results ---
+    else:
+        # Tab 1: Enhancement
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("<h4 class='center-text fade-in'>Original Dark Image</h4>", unsafe_allow_html=True)
+                st.image(img_array, use_container_width=True)
+                
+            with col2:
+                st.markdown("<h4 class='center-text fade-in'>Enhanced Image</h4>", unsafe_allow_html=True)
+                st.image(processed_img, use_container_width=True)
+                
+            render_metrics_and_dl(img_array, processed_img, crater_data, "tab1")
 
-    # --- Render Tab 2 Results ---
-    with crater_placeholder.container():
-        st.markdown("<h4 class='center-text fade-in'>Automated Crater Detection</h4>", unsafe_allow_html=True)
-        st.markdown("<p class='center-text fade-in'>Hover over the highlighted areas to view the size and circularity of the detected craters.</p>", unsafe_allow_html=True)
-        
-        img_rgb = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-        fig = px.imshow(img_rgb)
-        for c in crater_data:
-            fig.add_shape(type="rect", x0=c['x'], y0=c['y'], x1=c['x']+c['w'], y1=c['y']+c['h'], line=dict(color="#00F0FF", width=2.5))
-            fig.add_trace(go.Scatter(x=[c['x'] + c['w']/2], y=[c['y'] + c['h']/2], mode="markers", marker=dict(color="rgba(0,0,0,0)", size=40), text=[f"<b>CRATER DETECTED</b><br>Size (Area): {c['area']} px²<br>Circularity: {c['circ']}"], hoverinfo="text", showlegend=False))
-        fig.update_xaxes(visible=False)
-        fig.update_yaxes(visible=False)
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), hovermode="closest", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", xaxis=dict(scaleanchor="y", scaleratio=1))
-        
-        st.plotly_chart(fig, use_container_width=True)
+        # Tab 2: Crater Detection
+        with tab2:
+            st.markdown("<h4 class='center-text fade-in'>Automated Crater Detection</h4>", unsafe_allow_html=True)
+            st.markdown("<p class='center-text fade-in'>Hover over the highlighted areas to view the size and circularity of the detected craters.</p>", unsafe_allow_html=True)
+            
+            img_rgb = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
+            fig = px.imshow(img_rgb)
+            for c in crater_data:
+                fig.add_shape(type="rect", x0=c['x'], y0=c['y'], x1=c['x']+c['w'], y1=c['y']+c['h'], line=dict(color="#00F0FF", width=2.5))
+                fig.add_trace(go.Scatter(x=[c['x'] + c['w']/2], y=[c['y'] + c['h']/2], mode="markers", marker=dict(color="rgba(0,0,0,0)", size=40), text=[f"<b>CRATER DETECTED</b><br>Size (Area): {c['area']} px²<br>Circularity: {c['circ']}"], hoverinfo="text", showlegend=False))
+            
+            fig.update_xaxes(visible=False)
+            fig.update_yaxes(visible=False)
+            
+            fig.update_layout(
+                height=750, 
+                margin=dict(l=0, r=0, t=0, b=0), 
+                hovermode="closest", 
+                paper_bgcolor="rgba(0,0,0,0)", 
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(scaleanchor="y", scaleratio=1)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            render_metrics_and_dl(img_array, processed_img, crater_data, "tab2")
 
-    with metrics_placeholder_tab2.container():
-        render_metrics_and_dl(img_array, processed_img, crater_data, "tab2")
+        # Tab 3: 3D Map & Safe Landing
+        with tab3:
+            st.markdown("<h4 class='center-text fade-in'>3D Lunar Surface & Safe Landing Zones</h4>", unsafe_allow_html=True)
+            
+            col_3d_1, col_3d_2 = st.columns(2)
+            
+            with col_3d_1:
+                # 3D MAP FIX: Added heavy GaussianBlur so the terrain renders smooth, not spiky.
+                smoothed_for_3d = cv2.GaussianBlur(processed_img, (15, 15), 0)
+                scale_percent = 25 
+                width = int(smoothed_for_3d.shape[1] * scale_percent / 100)
+                height = int(smoothed_for_3d.shape[0] * scale_percent / 100)
+                dim = (width, height)
+                resized_img = cv2.resize(smoothed_for_3d, dim, interpolation=cv2.INTER_AREA)
+                
+                inverted_img = 255 - resized_img
+                
+                fig_3d = go.Figure(data=[go.Surface(z=inverted_img, colorscale='IceFire')])
+                fig_3d.update_layout(
+                    title='Interactive 3D Terrain Map',
+                    autosize=True,
+                    margin=dict(l=0, r=0, b=0, t=40),
+                    scene=dict(
+                        xaxis=dict(visible=False),
+                        yaxis=dict(visible=False),
+                        zaxis=dict(title='Depth', showgrid=False)
+                    ),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="white")
+                )
+                st.plotly_chart(fig_3d, use_container_width=True)
+
+            with col_3d_2:
+                # Safe Landing Map remains untouched because it works perfectly.
+                smooth_for_sobel = cv2.GaussianBlur(processed_img, (15, 15), 0)
+                
+                sobelx = cv2.Sobel(smooth_for_sobel, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(smooth_for_sobel, cv2.CV_64F, 0, 1, ksize=3)
+                gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+                
+                gradient_normalized = cv2.normalize(gradient_magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                
+                _, slope_hazard = cv2.threshold(gradient_normalized, 45, 255, cv2.THRESH_BINARY)
+                _, dark_hazard = cv2.threshold(smooth_for_sobel, 50, 255, cv2.THRESH_BINARY_INV)
+                
+                hazard_mask = cv2.bitwise_or(slope_hazard, dark_hazard)
+                safe_mask = cv2.bitwise_not(hazard_mask)
+                
+                overlay = np.zeros((img_height, img_width, 3), dtype=np.uint8)
+                overlay[safe_mask == 255] = [0, 255, 0]   
+                overlay[hazard_mask == 255] = [255, 0, 0] 
+                
+                img_color = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
+                landing_map = cv2.addWeighted(img_color, 0.6, overlay, 0.4, 0)
+                
+                st.markdown("<p style='text-align: center; color: white; font-weight: bold;'>Rover Safe Landing Map</p>", unsafe_allow_html=True)
+                st.image(landing_map, use_container_width=True, caption="Green: Safe Flat Ground | Red: Crater Floors & Steep Rims")
